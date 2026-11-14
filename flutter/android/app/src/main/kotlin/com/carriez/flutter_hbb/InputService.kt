@@ -8,7 +8,9 @@ package com.carriez.flutter_hbb
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.UiModeManager
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
@@ -19,6 +21,8 @@ import android.widget.EditText
 import android.view.accessibility.AccessibilityEvent
 import android.view.ViewGroup.LayoutParams
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import android.provider.Settings
 import android.view.KeyEvent as KeyEventAndroid
 import android.view.ViewConfiguration
 import android.graphics.Rect
@@ -45,6 +49,8 @@ const val LEFT_UP = 10
 const val RIGHT_UP = 18
 // (BUTTON_BACK << 3) | BUTTON_UP
 const val BACK_UP = 66
+// (BUTTON_FORWARD << 3) | BUTTON_UP
+const val FORWARD_UP = 130
 const val WHEEL_BUTTON_DOWN = 33
 const val WHEEL_BUTTON_UP = 34
 const val WHEEL_DOWN = 523331
@@ -58,6 +64,10 @@ const val MOUSE_TYPE_WHEEL = 3
 // WHEEL_STEP; tuned on real devices during review (the full 120px felt too
 // far per tick).
 const val MOUSE_WHEEL_STEP = 90
+// Android TV: pointer travel per drag scroll step, and the minimum time
+// between wheel scroll steps.
+const val TV_DRAG_STEP = 150
+const val TV_SCROLL_INTERVAL = 120L
 
 const val TOUCH_SCALE_START = 1
 const val TOUCH_SCALE = 2
@@ -97,6 +107,22 @@ class InputService : AccessibilityService() {
     private var mouseY = 0
     private var timer = Timer()
     private var recentActionTask: TimerTask? = null
+
+    // Android TV ignores most touch input, so a left click there is sent to
+    // the view under the pointer as an accessibility click instead.
+    private val isTv: Boolean by lazy {
+        val uiModeManager = getSystemService(UI_MODE_SERVICE) as? UiModeManager
+        uiModeManager?.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION
+    }
+    private val touchSlop: Int by lazy { ViewConfiguration.get(this).scaledTouchSlop }
+    @Volatile private var tvTapPending = false
+    private var tvTapDownX = 0
+    private var tvTapDownY = 0
+    // On Android TV a drag scrolls with accessibility actions, because the
+    // TV ignores injected touch gestures.
+    private var tvDragScroll = false
+    private var tvDragLastY = 0
+    private var lastTvScrollTime = 0L
     // 100(tap timeout) + 400(long press timeout)
     private val longPressDuration = ViewConfiguration.getTapTimeout().toLong() + ViewConfiguration.getLongPressTimeout().toLong()
 
@@ -141,8 +167,9 @@ class InputService : AccessibilityService() {
             isWaitingLongPress = true
             timer.schedule(object : TimerTask() {
                 override fun run() {
-                    if (isWaitingLongPress) {
+                    if (isWaitingLongPress && !tvDragScroll) {
                         isWaitingLongPress = false
+                        tvTapPending = false
                         continueGesture(mouseX, mouseY)
                     }
                 }
@@ -150,7 +177,61 @@ class InputService : AccessibilityService() {
 
             leftIsDown = true
             startGesture(mouseX, mouseY)
+            if (isTv) {
+                tvTapPending = true
+                tvTapDownX = mouseX
+                tvTapDownY = mouseY
+            }
             return
+        }
+
+        // On Android TV, hold back the touch gesture until the pointer moves
+        // (drag) or the button is released (click).
+        if (leftIsDown && tvTapPending) {
+            if (mask == LEFT_UP) {
+                tvTapPending = false
+                leftIsDown = false
+                isWaitingLongPress = false
+                // A click on the screensaver (Ambient mode) only wakes the
+                // TV, like a remote button press.
+                if (isScreensaverShowing()) {
+                    val ok = performGlobalAction(GLOBAL_ACTION_BACK)
+                    Log.d(logTag, "tv click on screensaver, back ok:$ok")
+                    return
+                }
+                if (!tryClickNodeAt(tvTapDownX, tvTapDownY)) {
+                    endGesture(mouseX, mouseY)
+                }
+                return
+            }
+            if (abs(mouseX - tvTapDownX) + abs(mouseY - tvTapDownY) <= touchSlop) {
+                return
+            }
+            tvTapPending = false
+            // A slow drag can pass the touch slop without any single move
+            // cancelling the long press, so cancel it here.
+            isWaitingLongPress = false
+            tvDragScroll = true
+            tvDragLastY = tvTapDownY
+        }
+
+        if (tvDragScroll) {
+            if (mask == LEFT_UP) {
+                tvDragScroll = false
+                leftIsDown = false
+                isWaitingLongPress = false
+                return
+            }
+            if (leftIsDown) {
+                // One scroll step per TV_DRAG_STEP pixels of pointer travel.
+                // Dragging up pulls the content up, like a touch screen.
+                val dy = mouseY - tvDragLastY
+                if (abs(dy) >= TV_DRAG_STEP) {
+                    tvDragLastY = mouseY
+                    tvScrollAt(tvTapDownX, tvTapDownY, dy < 0)
+                }
+                return
+            }
         }
 
         // left down, was down
@@ -175,6 +256,25 @@ class InputService : AccessibilityService() {
 
         if (mask == BACK_UP) {
             performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+
+        // On Android TV the forward side button acts as Enter (D-pad center).
+        if (mask == FORWARD_UP && isTv && Build.VERSION.SDK_INT >= 33) {
+            performGlobalAction(GLOBAL_ACTION_DPAD_CENTER)
+            return
+        }
+
+        // On Android TV the wheel scrolls the view under the pointer with
+        // accessibility actions, because the TV ignores injected swipes.
+        if (mask == MOUSE_TYPE_WHEEL && isTv) {
+            if (_y != 0) {
+                val now = System.currentTimeMillis()
+                if (now - lastTvScrollTime >= TV_SCROLL_INTERVAL) {
+                    lastTvScrollTime = now
+                    tvScrollAt(mouseX, mouseY, _y < 0)
+                }
+            }
             return
         }
 
@@ -474,6 +574,8 @@ class InputService : AccessibilityService() {
                 return
             } else if (tryHandlePowerKeyEvent(event)) {
                 return
+            } else if (tryHandleDpadKeyEvent(event)) {
+                return
             }
         }
 
@@ -551,6 +653,218 @@ class InputService : AccessibilityService() {
             return true
         }
         return false
+    }
+
+    // Android TV moves focus with D-pad keys, but an
+    // accessibility service cannot inject key events outside a text field.
+    // Map arrow, Enter and Escape keys to D-pad global actions instead,
+    // unless an editable field has input focus (arrows then move the caret).
+    private fun tryHandleDpadKeyEvent(event: KeyEventAndroid): Boolean {
+        if (!isTv || Build.VERSION.SDK_INT < 33) {
+            return false
+        }
+        val action = when (event.keyCode) {
+            KeyEventAndroid.KEYCODE_DPAD_UP -> GLOBAL_ACTION_DPAD_UP
+            KeyEventAndroid.KEYCODE_DPAD_DOWN -> GLOBAL_ACTION_DPAD_DOWN
+            KeyEventAndroid.KEYCODE_DPAD_LEFT -> GLOBAL_ACTION_DPAD_LEFT
+            KeyEventAndroid.KEYCODE_DPAD_RIGHT -> GLOBAL_ACTION_DPAD_RIGHT
+            KeyEventAndroid.KEYCODE_DPAD_CENTER,
+            KeyEventAndroid.KEYCODE_ENTER,
+            KeyEventAndroid.KEYCODE_NUMPAD_ENTER -> GLOBAL_ACTION_DPAD_CENTER
+            KeyEventAndroid.KEYCODE_ESCAPE -> GLOBAL_ACTION_BACK
+            else -> return false
+        }
+        if (isEditableFocused()) {
+            return false
+        }
+        // Act on key down only, so one press moves focus once.
+        // Key repeat sends more key downs while the key is held.
+        if (event.action == KeyEventAndroid.ACTION_DOWN) {
+            val ok = performGlobalAction(action)
+            Log.d(logTag, "dpad keyCode:${event.keyCode} globalAction:$action ok:$ok")
+        }
+        return true
+    }
+
+    // Package of the configured screensaver, for example Google TV Ambient
+    // mode (com.google.android.apps.tv.dreamx).
+    private val screensaverPackage: String? by lazy {
+        try {
+            Settings.Secure.getString(contentResolver, "screensaver_components")
+                ?.split(',')?.firstOrNull()?.substringBefore('/')?.ifEmpty { null }
+        } catch (e: Exception) {
+            null
+        } ?: "com.google.android.apps.tv.dreamx"
+    }
+
+    // True when the top application window belongs to the screensaver.
+    private fun isScreensaverShowing(): Boolean {
+        val top = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION }
+        val pkg = (top?.root ?: rootInActiveWindow)?.packageName?.toString()
+        return pkg != null && pkg == screensaverPackage
+    }
+
+    // Clicks the view under (x, y) with accessibility actions. Android TV
+    // apps such as the launcher react to focus and click, not to touch.
+    private fun tryClickNodeAt(x: Int, y: Int): Boolean {
+        val node = findClickableNodeAt(x, y) ?: return false
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        // A list or grid whose items are not clickable themselves clicks its
+        // selected item, not the one under the pointer. Select and focus the
+        // item under the pointer first.
+        val item = if (isCollection(node)) childAt(node, x, y) else null
+        if (item != null) {
+            item.performAction(AccessibilityNodeInfo.ACTION_SELECT)
+            item.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            if (item.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                Log.d(logTag, "tv click x:$x y:$y item:${item.className} ok:true")
+                return true
+            }
+        }
+        // A screen-sized container (for example a Flutter view whose children
+        // were not found) clicks its focused child, not the one under the
+        // pointer. Let the caller send a touch tap instead.
+        if (isScreenSized(bounds)) {
+            Log.d(logTag, "tv click x:$x y:$y node:${node.className} $bounds container, touch")
+            return false
+        }
+        if (node.isFocusable() && !node.isFocused()) {
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        }
+        var ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        if (!ok && node.isFocused() && Build.VERSION.SDK_INT >= 33) {
+            ok = performGlobalAction(GLOBAL_ACTION_DPAD_CENTER)
+        }
+        Log.d(logTag, "tv click x:$x y:$y node:${node.className} $bounds ok:$ok")
+        return ok
+    }
+
+    private fun findClickableNodeAt(x: Int, y: Int): AccessibilityNodeInfo? {
+        // getWindows() lists windows from top to bottom.
+        val roots = windows.mapNotNull { it.root }.ifEmpty { listOfNotNull(rootInActiveWindow) }
+        for (root in roots) {
+            val clickable = ArrayList<Pair<AccessibilityNodeInfo, Long>>()
+            val focusable = ArrayList<Pair<AccessibilityNodeInfo, Long>>()
+            collectNodesAt(root, x, y, clickable, focusable)
+            // The smallest node under the pointer is the one the user aimed
+            // at: a menu item, not the full-screen barrier behind the menu.
+            // Clickable nodes win over nodes that are only focusable; on a tie
+            // the deepest node wins.
+            val best = (clickable.ifEmpty { focusable }).asReversed().minByOrNull { it.second }
+            if (best != null) {
+                return best.first
+            }
+        }
+        return null
+    }
+
+    private fun collectNodesAt(
+        node: AccessibilityNodeInfo,
+        x: Int,
+        y: Int,
+        clickable: MutableList<Pair<AccessibilityNodeInfo, Long>>,
+        focusable: MutableList<Pair<AccessibilityNodeInfo, Long>>
+    ) {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        // Some apps (Flutter) mark container nodes as not visible while their
+        // children are visible, so only bounds decide whether to descend.
+        if (!rect.contains(x, y)) {
+            return
+        }
+        if (node.isVisibleToUser()) {
+            val area = rect.width().toLong() * rect.height()
+            if (node.isClickable()) {
+                clickable.add(Pair(node, area))
+            } else if (node.isFocusable()) {
+                focusable.add(Pair(node, area))
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectNodesAt(child, x, y, clickable, focusable)
+        }
+    }
+
+    // Scrolls the smallest scrollable node under (x, y); [forward] moves the
+    // content toward its end. Falls back to D-pad up/down, which moves focus
+    // and scrolls focused lists.
+    private fun tvScrollAt(x: Int, y: Int, forward: Boolean) {
+        val action = if (forward) {
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        } else {
+            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        }
+        val roots = windows.mapNotNull { it.root }.ifEmpty { listOfNotNull(rootInActiveWindow) }
+        for (root in roots) {
+            val found = ArrayList<Pair<AccessibilityNodeInfo, Long>>()
+            collectScrollableAt(root, x, y, found)
+            for ((node, _) in found.asReversed().sortedBy { it.second }) {
+                if (node.performAction(action)) {
+                    Log.d(logTag, "tv scroll x:$x y:$y forward:$forward node:${node.className}")
+                    return
+                }
+            }
+            if (found.isNotEmpty()) {
+                break
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            val ok = performGlobalAction(if (forward) GLOBAL_ACTION_DPAD_DOWN else GLOBAL_ACTION_DPAD_UP)
+            Log.d(logTag, "tv scroll x:$x y:$y forward:$forward dpad ok:$ok")
+        }
+    }
+
+    private fun collectScrollableAt(
+        node: AccessibilityNodeInfo,
+        x: Int,
+        y: Int,
+        found: MutableList<Pair<AccessibilityNodeInfo, Long>>
+    ) {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (!rect.contains(x, y)) {
+            return
+        }
+        if (node.isScrollable() && node.isVisibleToUser()) {
+            found.add(Pair(node, rect.width().toLong() * rect.height()))
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectScrollableAt(child, x, y, found)
+        }
+    }
+
+    private fun isScreenSized(rect: Rect): Boolean {
+        val metrics = resources.displayMetrics
+        val screenArea = metrics.widthPixels.toLong() * metrics.heightPixels
+        return rect.width().toLong() * rect.height() >= screenArea * 9 / 10
+    }
+
+    private fun isCollection(node: AccessibilityNodeInfo): Boolean {
+        if (node.collectionInfo != null) {
+            return true
+        }
+        val name = node.className?.toString() ?: return false
+        return name.endsWith("GridView") || name.endsWith("ListView") || name.endsWith("RecyclerView")
+    }
+
+    private fun childAt(node: AccessibilityNodeInfo, x: Int, y: Int): AccessibilityNodeInfo? {
+        val rect = Rect()
+        for (i in node.childCount - 1 downTo 0) {
+            val child = node.getChild(i) ?: continue
+            child.getBoundsInScreen(rect)
+            if (child.isVisibleToUser() && rect.contains(x, y)) {
+                return child
+            }
+        }
+        return null
+    }
+
+    private fun isEditableFocused(): Boolean {
+        val node = findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+        return node.isEditable()
     }
 
     private fun insertAccessibilityNode(list: LinkedList<AccessibilityNodeInfo>, node: AccessibilityNodeInfo) {

@@ -502,6 +502,8 @@ class DialogTextField extends StatelessWidget {
   final TextInputType? keyboardType;
   final List<TextInputFormatter>? inputFormatters;
   final int? maxLength;
+  final TextInputAction? textInputAction;
+  final ValueChanged<String>? onSubmitted;
 
   static const kUsernameTitle = 'Username';
   static const kUsernameIcon = Icon(Icons.account_circle_outlined);
@@ -520,6 +522,8 @@ class DialogTextField extends StatelessWidget {
       this.keyboardType,
       this.inputFormatters,
       this.maxLength,
+      this.textInputAction,
+      this.onSubmitted,
       required this.title,
       required this.controller})
       : super(key: key);
@@ -547,6 +551,8 @@ class DialogTextField extends StatelessWidget {
                 keyboardType: keyboardType,
                 inputFormatters: inputFormatters,
                 maxLength: maxLength,
+                textInputAction: textInputAction,
+                onSubmitted: onSubmitted,
               ),
               if (errorText != null)
                 Align(
@@ -819,6 +825,8 @@ class PasswordWidget extends StatefulWidget {
     this.errorText,
     this.title,
     this.maxLength,
+    this.textInputAction,
+    this.onSubmitted,
   }) : super(key: key);
 
   final TextEditingController controller;
@@ -828,6 +836,8 @@ class PasswordWidget extends StatefulWidget {
   final String? errorText;
   final String? title;
   final int? maxLength;
+  final TextInputAction? textInputAction;
+  final ValueChanged<String>? onSubmitted;
 
   @override
   State<PasswordWidget> createState() => _PasswordWidgetState();
@@ -891,6 +901,8 @@ class _PasswordWidgetState extends State<PasswordWidget> {
       errorText: widget.errorText,
       focusNode: _focusNode,
       maxLength: widget.maxLength,
+      textInputAction: widget.textInputAction,
+      onSubmitted: widget.onSubmitted,
     );
   }
 }
